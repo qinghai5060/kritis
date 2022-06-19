@@ -17,7 +17,6 @@ package config
 
 import (
 	"context"
-
 	"knative.dev/pkg/configmap"
 )
 
@@ -26,7 +25,7 @@ type cfgKey struct{}
 // Config holds the collection of configurations that we attach to contexts.
 // +k8s:deepcopy-gen=false
 type Config struct {
-	//ImagePolicyConfig *ImagePolicyConfig
+	ImagePolicyConfig *ImagePolicyConfig
 }
 
 // FromContext extracts a Config from the provided context.

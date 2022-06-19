@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"github.com/golang/glog"
 	"github.com/grafeas/kritis/pkg/kritis/config"
+	"github.com/grafeas/kritis/pkg/kritis/crd/kritisconfig"
+	"github.com/grafeas/kritis/pkg/kritis/metadata/grafeas"
 	"github.com/grafeas/kritis/pkg/kritis/review"
 	"github.com/pkg/errors"
 	"net/http"
@@ -30,7 +32,6 @@ import (
 	"time"
 
 	kubernetesutil "github.com/grafeas/kritis/pkg/kritis/kubernetes"
-	"github.com/grafeas/kritis/pkg/kritis/metadata/grafeas"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	batchv1beta1 "k8s.io/api/batch/v1beta1"
@@ -52,7 +53,6 @@ import (
 	"github.com/grafeas/kritis/cmd/kritis/version"
 	"github.com/grafeas/kritis/pkg/kritis/admission"
 	"github.com/grafeas/kritis/pkg/kritis/constants"
-	"github.com/grafeas/kritis/pkg/kritis/crd/kritisconfig"
 	"github.com/grafeas/kritis/pkg/kritis/cron"
 )
 
@@ -102,79 +102,11 @@ func main() {
 	// Allow folks to configure the port the webhook serves on.
 	flag.IntVar(&opts.Port, "secure-port", opts.Port, "The port on which to serve HTTPS.")
 
-	sharedmain.MainWithContext(ctx, "policy-controller",
+	sharedmain.MainWithContext(ctx, "kritis-validation",
 		certificates.NewController,
+		NewValidatingAdmissionController,
 	)
-	// KritisConfig is a cluster-wide CRD.
-	kritisConfigs, err := kritisconfig.KritisConfigs()
-	if err != nil {
-		errMsg := fmt.Sprintf("error getting kritis config: %v", err)
-		glog.Errorf(errMsg)
-		return
-	}
 
-	// Set the defaults that will be used if no KritisConfig is defined
-	metadataBackend := DefaultMetadataBackend
-	cronInterval := DefaultCronInterval
-	serverAddr := DefaultServerAddr
-
-	config := &admission.Config{
-		Metadata: metadataBackend,
-	}
-
-	if len(kritisConfigs) == 0 {
-		glog.Infof("No KritisConfigs found in any namespace, will assume the defaults")
-	} else if len(kritisConfigs) > 1 {
-		glog.Errorf("More than 1 KritisConfig found, expected to have only 1 in the cluster")
-		return
-	} else {
-		kritisConf := kritisConfigs[0]
-		// TODO(https://github.com/grafeas/kritis/issues/304): Use CRD validation instead
-		if kritisConf.Spec.MetadataBackend != "" {
-			config.Metadata = kritisConf.Spec.MetadataBackend
-		}
-		if kritisConf.Spec.CronInterval != "" {
-			cronInterval = kritisConf.Spec.CronInterval
-		}
-		if kritisConf.Spec.ServerAddr != "" {
-			serverAddr = kritisConf.Spec.ServerAddr
-		}
-		if config.Metadata == constants.GrafeasMetadata {
-			config.Grafeas = kritisConf.Spec.Grafeas
-			if err := grafeas.ValidateConfig(config.Grafeas); err != nil {
-				glog.Fatal(err)
-			}
-			certs, err := grafeas.LoadConfig(grafeasCerts)
-			if err != nil {
-				glog.Fatal(err)
-			}
-			config.Certs = certs
-		}
-	}
-	// TODO: (tejaldesai) This is getting complicated. Use CLI Library.
-	if runCron {
-		cronConfig, err := getCronConfig(config)
-		if err != nil {
-			glog.Fatalf("Could not run cron job in foreground: %s", err)
-		}
-		if err := cron.RunInForeground(*cronConfig); err != nil {
-			glog.Fatalf("Error Checking pods: %s", err)
-		}
-		return
-	}
-
-	// Kick off background cron job.
-	if err := StartCronJob(config, cronInterval); err != nil {
-		glog.Fatal(errors.Wrap(err, "starting background job"))
-	}
-
-	// Start the Kritis Server.
-	glog.Infof("Running the server, address: %s", serverAddr)
-	http.HandleFunc("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		admission.ReviewHandler(w, r, config)
-	}))
-	httpsServer := NewServer(serverAddr)
-	glog.Fatal(httpsServer.ListenAndServeTLS(tlsCertFile, tlsKeyFile))
 }
 
 func NewServer(addr string) *http.Server {
@@ -259,4 +191,77 @@ func NewValidatingAdmissionController(ctx context.Context, cmw configmap.Watcher
 		// Extra validating callbacks to be applied to resources.
 		nil,
 	)
+}
+
+func newValidationWebhook() {
+	// KritisConfig is a cluster-wide CRD.
+	kritisConfigs, err := kritisconfig.KritisConfigs()
+	if err != nil {
+		errMsg := fmt.Sprintf("error getting kritis config: %v", err)
+		glog.Errorf(errMsg)
+		return
+	}
+
+	// Set the defaults that will be used if no KritisConfig is defined
+	metadataBackend := DefaultMetadataBackend
+	cronInterval := DefaultCronInterval
+	serverAddr := DefaultServerAddr
+
+	config := &admission.Config{
+		Metadata: metadataBackend,
+	}
+
+	if len(kritisConfigs) == 0 {
+		glog.Infof("No KritisConfigs found in any namespace, will assume the defaults")
+	} else if len(kritisConfigs) > 1 {
+		glog.Errorf("More than 1 KritisConfig found, expected to have only 1 in the cluster")
+		return
+	} else {
+		kritisConf := kritisConfigs[0]
+		// TODO(https://github.com/grafeas/kritis/issues/304): Use CRD validation instead
+		if kritisConf.Spec.MetadataBackend != "" {
+			config.Metadata = kritisConf.Spec.MetadataBackend
+		}
+		if kritisConf.Spec.CronInterval != "" {
+			cronInterval = kritisConf.Spec.CronInterval
+		}
+		if kritisConf.Spec.ServerAddr != "" {
+			serverAddr = kritisConf.Spec.ServerAddr
+		}
+		if config.Metadata == constants.GrafeasMetadata {
+			config.Grafeas = kritisConf.Spec.Grafeas
+			if err := grafeas.ValidateConfig(config.Grafeas); err != nil {
+				glog.Fatal(err)
+			}
+			certs, err := grafeas.LoadConfig(grafeasCerts)
+			if err != nil {
+				glog.Fatal(err)
+			}
+			config.Certs = certs
+		}
+	}
+	// TODO: (tejaldesai) This is getting complicated. Use CLI Library.
+	if runCron {
+		cronConfig, err := getCronConfig(config)
+		if err != nil {
+			glog.Fatalf("Could not run cron job in foreground: %s", err)
+		}
+		if err := cron.RunInForeground(*cronConfig); err != nil {
+			glog.Fatalf("Error Checking pods: %s", err)
+		}
+		return
+	}
+
+	// Kick off background cron job.
+	if err := StartCronJob(config, cronInterval); err != nil {
+		glog.Fatal(errors.Wrap(err, "starting background job"))
+	}
+
+	// Start the Kritis Server.
+	glog.Infof("Running the server, address: %s", serverAddr)
+	http.HandleFunc("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		admission.ReviewHandler(w, r, config)
+	}))
+	httpsServer := NewServer(serverAddr)
+	glog.Fatal(httpsServer.ListenAndServeTLS(tlsCertFile, tlsKeyFile))
 }

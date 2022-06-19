@@ -21,21 +21,39 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"github.com/golang/glog"
+	"github.com/grafeas/kritis/pkg/kritis/config"
+	"github.com/grafeas/kritis/pkg/kritis/review"
+	"github.com/pkg/errors"
 	"net/http"
 	_ "net/http/pprof"
 	"time"
 
-	"github.com/golang/glog"
+	kubernetesutil "github.com/grafeas/kritis/pkg/kritis/kubernetes"
+	"github.com/grafeas/kritis/pkg/kritis/metadata/grafeas"
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	batchv1beta1 "k8s.io/api/batch/v1beta1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes"
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	duckv1 "knative.dev/pkg/apis/duck/v1"
+	"knative.dev/pkg/configmap"
+	"knative.dev/pkg/controller"
+	"knative.dev/pkg/injection/sharedmain"
+	"knative.dev/pkg/logging"
+	"knative.dev/pkg/signals"
+	"knative.dev/pkg/webhook"
+	"knative.dev/pkg/webhook/certificates"
+	"knative.dev/pkg/webhook/resourcesemantics"
+	"knative.dev/pkg/webhook/resourcesemantics/validation"
+
 	"github.com/grafeas/kritis/cmd/kritis/version"
 	"github.com/grafeas/kritis/pkg/kritis/admission"
 	"github.com/grafeas/kritis/pkg/kritis/constants"
 	"github.com/grafeas/kritis/pkg/kritis/crd/kritisconfig"
 	"github.com/grafeas/kritis/pkg/kritis/cron"
-	kubernetesutil "github.com/grafeas/kritis/pkg/kritis/kubernetes"
-	"github.com/grafeas/kritis/pkg/kritis/metadata/grafeas"
-	"github.com/pkg/errors"
-	"k8s.io/client-go/kubernetes"
-	_ "k8s.io/client-go/plugin/pkg/client/auth"
 )
 
 const (
@@ -51,6 +69,8 @@ var (
 	grafeasCerts string
 	showVersion  bool
 	runCron      bool
+	webhookName  string
+	secretName   string
 )
 
 func main() {
@@ -59,6 +79,9 @@ func main() {
 	flag.StringVar(&grafeasCerts, "grafeas-certs", "/etc/config/grafeascerts.yaml", "Grafeas certificates.")
 	flag.BoolVar(&showVersion, "version", false, "kritis-server version")
 	flag.BoolVar(&runCron, "run-cron", false, "Run cron job in foreground.")
+	flag.StringVar(&webhookName, "webhook-name", "policy.sigstore.dev", "The name of the validating and mutating webhook configurations as well as the webhook name that is automatically configured, if exists, with different rules and client settings setting how the admission requests to be dispatched to policy-controller.")
+	flag.StringVar(&secretName, "secret-name", "", "The name of the secret in the webhook's namespace that holds the public key for verification.")
+
 	flag.Parse()
 	if err := flag.Set("logtostderr", "true"); err != nil {
 		glog.Fatal(errors.Wrap(err, "unable to set logtostderr"))
@@ -69,6 +92,19 @@ func main() {
 		return
 	}
 
+	opts := webhook.Options{
+		ServiceName: "webhook",
+		Port:        443,
+		SecretName:  "webhook-certs",
+	}
+	ctx := webhook.WithOptions(signals.NewContext(), opts)
+
+	// Allow folks to configure the port the webhook serves on.
+	flag.IntVar(&opts.Port, "secure-port", opts.Port, "The port on which to serve HTTPS.")
+
+	sharedmain.MainWithContext(ctx, "policy-controller",
+		certificates.NewController,
+	)
 	// KritisConfig is a cluster-wide CRD.
 	kritisConfigs, err := kritisconfig.KritisConfigs()
 	if err != nil {
@@ -176,4 +212,51 @@ func getCronConfig(config *admission.Config) (*cron.Config, error) {
 		return nil, err
 	}
 	return cron.NewCronConfig(kcs, client), nil
+}
+
+var types = map[schema.GroupVersionKind]resourcesemantics.GenericCRD{
+	corev1.SchemeGroupVersion.WithKind("Pod"): &duckv1.Pod{},
+
+	appsv1.SchemeGroupVersion.WithKind("ReplicaSet"):  &duckv1.WithPod{},
+	appsv1.SchemeGroupVersion.WithKind("Deployment"):  &duckv1.WithPod{},
+	appsv1.SchemeGroupVersion.WithKind("StatefulSet"): &duckv1.WithPod{},
+	appsv1.SchemeGroupVersion.WithKind("DaemonSet"):   &duckv1.WithPod{},
+	batchv1.SchemeGroupVersion.WithKind("Job"):        &duckv1.WithPod{},
+
+	batchv1.SchemeGroupVersion.WithKind("CronJob"):      &duckv1.CronJob{},
+	batchv1beta1.SchemeGroupVersion.WithKind("CronJob"): &duckv1.CronJob{},
+}
+
+func NewValidatingAdmissionController(ctx context.Context, cmw configmap.Watcher) *controller.Impl {
+	// Decorate contexts with the current state of the config.
+	store := config.NewStore(logging.FromContext(ctx).Named("config-store"))
+	store.WatchConfigs(cmw)
+	validator := review.NewValidator(ctx, secretName)
+
+	return validation.NewAdmissionController(ctx,
+		// Name of the resource webhook.
+		webhookName,
+
+		// The path on which to serve the webhook.
+		"/validations",
+
+		// The resources to validate.
+		types,
+
+		// A function that infuses the context passed to Validate/SetDefaults with custom metadata.
+		func(ctx context.Context) context.Context {
+			ctx = store.ToContext(ctx)
+			ctx = duckv1.WithPodValidator(ctx, validator.ValidatePod)
+			ctx = duckv1.WithPodSpecValidator(ctx, validator.ValidatePodSpecable)
+			ctx = duckv1.WithCronJobValidator(ctx, validator.ValidateCronJob)
+			return ctx
+		},
+
+		// Whether to disallow unknown fields.
+		// We pass false because we're using partial schemas.
+		false,
+
+		// Extra validating callbacks to be applied to resources.
+		nil,
+	)
 }

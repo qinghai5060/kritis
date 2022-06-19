@@ -56,7 +56,7 @@ type PublicKey struct {
 	KeyType string `json:"keyType`
 	// AsciiArmoredPgpPublicKey is the base64-encoded payload for a PGP public key. Provide
 	// this directly as a string.
-	AsciiArmoredPgpPublicKey string `json:"asciiArmoredPgpPublicKey,omitemtpy"`
+	AsciiArmoredPgpPublicKey string `json:"asciiArmoredPgpPublicKey,omitempty"`
 	// DO NOT USE THIS FIELD: it is currently unsupported.
 	// PkixPublicKey stores data for a PKIX public key.
 	PkixPublicKey PkixPublicKey `json:"pkixPublicKey,omitempty"`
